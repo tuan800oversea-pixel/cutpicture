@@ -4,27 +4,23 @@ import numpy as np
 from io import BytesIO
 import os
 import zipfile
+from PIL import Image
 
-# ================= 图片加载与高清导出 =================
+# ================= 图片加载 =================
 def load_raw_image(uploaded_file):
-    # 直接读取原始尺寸，不做任何压缩
     file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
     img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
     return img
 
-def convert_cv_to_bytes(cv_img, ext='.jpg'):
-    # 强制以最高质量/无损方式导出字节流
-    ext_lower = ext.lower()
-    if ext_lower in ['.jpg', '.jpeg']:
-        # JPG 设置为 100% 质量 (默认通常是 95)
-        res, img_encode = cv2.imencode(ext, cv_img, [int(cv2.IMWRITE_JPEG_QUALITY), 100])
-    elif ext_lower == '.png':
-        # PNG 设置为 0 压缩 (最高质量，文件最大)
-        res, img_encode = cv2.imencode(ext, cv_img, [int(cv2.IMWRITE_PNG_COMPRESSION), 0])
-    else:
-        res, img_encode = cv2.imencode(ext, cv_img)
-    return img_encode.tobytes()
+# ================= 转换为 300 DPI 的 JPG =================
+def convert_cv_to_bytes(cv_img):
+    cv_img_rgb = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
+    pil_img = Image.fromarray(cv_img_rgb)
+    buf = BytesIO()
+    pil_img.save(buf, format='JPEG', quality=100, dpi=(300, 300))
+    return buf.getvalue()
 
+# ================= 文件名智能匹配逻辑 =================
 def find_matching_reference(org_filename, ref_files):
     org_base = os.path.splitext(org_filename)[0]
     for ref in ref_files:
@@ -39,11 +35,9 @@ def find_matching_reference(org_filename, ref_files):
 
 # ================= 核心算法：双轨制高清对齐 =================
 def align_and_crop(org_img_highres, ref_img_highres):
-    # 1. 记录原始高清尺寸
     h_org, w_org = org_img_highres.shape[:2]
     h_ref, w_ref = ref_img_highres.shape[:2]
 
-    # 2. 为了防止服务器崩溃，生成用于“算数学题”的小图 (最长边800)
     max_calc_size = 800
     scale_org = 1.0
     if max(h_org, w_org) > max_calc_size:
@@ -59,7 +53,6 @@ def align_and_crop(org_img_highres, ref_img_highres):
     else:
         ref_img_small = ref_img_highres.copy()
 
-    # 3. 在小图上跑 SIFT 特征点提取
     gray_org = cv2.cvtColor(org_img_small, cv2.COLOR_BGR2GRAY)
     gray_ref = cv2.cvtColor(ref_img_small, cv2.COLOR_BGR2GRAY)
 
@@ -81,18 +74,15 @@ def align_and_crop(org_img_highres, ref_img_highres):
     if len(good_matches) < 10:
         return None, "匹配点不足，图片差异过大"
 
-    # 4. 获取小图上的匹配坐标，并【乘回缩放比例】还原到高清坐标系！
     src_pts = np.float32([kp1[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
     dst_pts = np.float32([kp2[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
     
-    src_pts = src_pts * scale_ref  # 还原为参考原图的真实像素位置
-    dst_pts = dst_pts * scale_org  # 还原为上传原图的真实像素位置
+    src_pts = src_pts * scale_ref  
+    dst_pts = dst_pts * scale_org  
 
-    # 5. 在高清坐标下计算透视矩阵
     M, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
     if M is None: return None, "无法计算透视变换矩阵"
 
-    # 使用高清参考图的四个角
     pts_ref = np.float32([[0, 0], [0, h_ref - 1], [w_ref - 1, h_ref - 1], [w_ref - 1, 0]]).reshape(-1, 1, 2)
     
     try:
@@ -105,17 +95,16 @@ def align_and_crop(org_img_highres, ref_img_highres):
 
     affine_matrix = cv2.getPerspectiveTransform(dst_pts_affine, ref_pts_affine)
     
-    # 6. 【高光时刻】拿算好的矩阵，直接去裁切最高清的原始图片！
     result_highres = cv2.warpPerspective(org_img_highres, affine_matrix, (w_ref, h_ref), 
                                          borderMode=cv2.BORDER_CONSTANT, borderValue=(255, 255, 255))
     return result_highres, "成功"
 
 
 # ================= 网页界面 (Streamlit) =================
-st.set_page_config(page_title="无损图片对齐工具", page_icon="📸", layout="wide")
+st.set_page_config(page_title="标准需求自动截图", page_icon="📸", layout="wide")
 
 st.title("📸 标准需求自动截图")
-st.markdown("**支持智能匹配：** 原图和参考图依靠文件名自动匹配（原图 `21.jpg` 会自动使用 `1.jpg` 作参考）。导出结果为原图 100% 尺寸与画质。")
+st.markdown("**支持智能匹配：** 原图和参考图依靠文件名自动匹配（原图 `21.jpg` 会自动使用 `1.jpg` 作参考）。导出结果为 **参考图的命名**，画质为 **100% 质量、300 DPI 的 JPG**。")
 st.divider()
 
 col1, col2 = st.columns(2)
@@ -147,7 +136,6 @@ if org_files and ref_files:
                     continue
                 
                 try:
-                    # 加载未经任何压缩的图片
                     org_img = load_raw_image(org_file)
                     matched_ref_file.seek(0) 
                     ref_img = load_raw_image(matched_ref_file)
@@ -155,7 +143,6 @@ if org_files and ref_files:
                     result_img, msg = align_and_crop(org_img, ref_img)
 
                     if result_img is not None:
-                        # 网页展示用缩略图即可（避免网页卡顿），但下载存的是上面的 result_img 高清图！
                         ref_display = cv2.resize(ref_img, (0,0), fx=0.3, fy=0.3)
                         res_display = cv2.resize(result_img, (0,0), fx=0.3, fy=0.3)
                         
@@ -165,11 +152,16 @@ if org_files and ref_files:
                         d_col1, d_col2, d_col3, d_col4 = st.columns([1, 1, 2, 2])
                         with d_col1: st.image(ref_rgb, caption=f"参考", use_container_width=True)
                         with d_col2: st.image(result_rgb, caption=f"结果", use_container_width=True)
-                        with d_col3: st.success(f"✅ 处理成功 (保留原画质)")
+                        with d_col3: st.success(f"✅ 处理成功 (300 DPI)")
                         
-                        ext = os.path.splitext(org_file.name)[1]
-                        result_bytes = convert_cv_to_bytes(result_img, ext=ext)
-                        zip_file.writestr(f"Aligned_{org_file.name}", result_bytes)
+                        # ================= 命名逻辑修改 =================
+                        # 提取【参考图】的文件名（去掉后缀）
+                        ref_base_name = os.path.splitext(matched_ref_file.name)[0]
+                        # 强制指定新文件名为：参考图文件名.jpg (例如：1.jpg)
+                        final_filename = f"{ref_base_name}.jpg"
+                        
+                        result_bytes = convert_cv_to_bytes(result_img)
+                        zip_file.writestr(final_filename, result_bytes)
                         success_count += 1
                     else:
                         st.error(f"❌ 失败：{msg}")
@@ -181,7 +173,7 @@ if org_files and ref_files:
         
         if success_count > 0:
             st.download_button(
-                label=f"📦 下载 {success_count} 张无损高清结果 (ZIP)",
+                label=f"📦 下载 {success_count} 张处理好的图片 (ZIP)",
                 data=zip_buffer.getvalue(),
                 file_name="aligned_highres_images.zip",
                 mime="application/zip",
