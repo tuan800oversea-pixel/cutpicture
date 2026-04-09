@@ -2,13 +2,11 @@ import streamlit as st
 import cv2
 import numpy as np
 from io import BytesIO
+import os
+import zipfile
 
-# ================= 新增：防崩溃的图片缩放机制 =================
-def resize_image(img, max_size=1200):
-    """
-    智能缩放：如果图片最长边超过 max_size，则等比例缩小。
-    大幅减少内存消耗，防止云端服务器崩溃。
-    """
+# ================= 防崩溃与图片加载 =================
+def resize_image(img, max_size=800):
     h, w = img.shape[:2]
     if max(h, w) > max_size:
         scale = max_size / max(h, w)
@@ -16,15 +14,36 @@ def resize_image(img, max_size=1200):
     return img
 
 def load_uploaded_image(uploaded_file):
-    # 将前端上传的文件转换为 OpenCV 格式
     file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
     img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
-    return resize_image(img) # 加载的同时进行安全缩放
+    return resize_image(img)
 
 def convert_cv_to_bytes(cv_img, ext='.jpg'):
-    # 将 OpenCV 处理后的图片转换回字节流
     res, img_encode = cv2.imencode(ext, cv_img)
-    return BytesIO(img_encode.tobytes())
+    return img_encode.tobytes()
+
+# ================= 文件名智能匹配逻辑 =================
+def find_matching_reference(org_filename, ref_files):
+    """
+    根据原图文件名寻找对应的参考图。
+    规则1：完全同名 (不看后缀)
+    规则2：原图名字的结尾包含参考图的名字 (例如：21 匹配 1)
+    """
+    org_base = os.path.splitext(org_filename)[0]
+    
+    # 优先尝试完全匹配
+    for ref in ref_files:
+        ref_base = os.path.splitext(ref.name)[0]
+        if org_base == ref_base:
+            return ref
+            
+    # 尝试尾号/后缀匹配
+    for ref in ref_files:
+        ref_base = os.path.splitext(ref.name)[0]
+        if org_base.endswith(ref_base):
+            return ref
+            
+    return None
 
 # ================= 核心算法部分 =================
 def align_and_crop(org_img, ref_img):
@@ -73,87 +92,100 @@ def align_and_crop(org_img, ref_img):
                                  borderValue=(255, 255, 255))
     return result, "成功"
 
+
 # ================= 网页界面 (Streamlit) =================
 st.set_page_config(page_title="图片视角对齐工具", page_icon="📸", layout="wide")
 
-st.title("📸 图片特征构图与视角对齐克隆工具")
+st.title("📸 标准需求自动截图)")
 st.markdown("""
-**欢迎使用！** 本工具可以提取参考图的视角和构图，并将你的原图裁切、拉伸成与之完全一致的画面。
-*无需人脸识别，完全基于图像特征（如花纹、边缘）进行物理对齐。*
-
-**👉 使用要求：**
-1. **原图** 和 **参考图** 必须包含相同的物体或场景。
-2. 原图的视野最好比参考图大，这样裁切后才不会出现白边。
+**命名规则提示：**
+原图和参考图依靠**文件名**进行自动匹配。你可以让它们**完全同名**，或者原图名字**以参考图名字结尾**（例如：原图 `21.jpg` 会自动使用 `1.jpg` 作为参考图去裁切）。
 """)
 
 st.divider()
 
-# 修改为多文件和单文件组合
 col1, col2 = st.columns(2)
 
 with col1:
-    st.subheader("1️⃣ 上传需要处理的【原图】(可多选)")
-    st.info("支持一次性拖拽或选择多张你想改变视角的图片。")
-    # accept_multiple_files=True 开启批量上传
-    org_files = st.file_uploader("选择原图 (JPG/PNG)", type=['png', 'jpg', 'jpeg'], accept_multiple_files=True, key="org")
+    st.subheader("1️⃣ 上传【原图】(可多选)")
+    org_files = st.file_uploader("选择需要裁切的原图", type=['png', 'jpg', 'jpeg'], accept_multiple_files=True, key="org")
 
 with col2:
-    st.subheader("2️⃣ 上传完美的【参考图】(单张)")
-    st.info("我们将提取这张图的构图视角作为标准。")
-    ref_file = st.file_uploader("选择参考图 (JPG/PNG)", type=['png', 'jpg', 'jpeg'], key="ref")
+    st.subheader("2️⃣ 上传【参考的拍图模板图】(可多选)")
+    ref_files = st.file_uploader("选择作为标准的参考图", type=['png', 'jpg', 'jpeg'], accept_multiple_files=True, key="ref")
 
-# 如果上传了原图(列表不为空) 并且 上传了参考图
-if org_files and ref_file:
+# 如果两边都上传了文件
+if org_files and ref_files:
     st.divider()
     
     col_btn1, col_btn2, col_btn3 = st.columns([1, 1, 1])
     with col_btn2:
-        start_btn = st.button(f"🚀 开始批量处理 ({len(org_files)}张)", use_container_width=True, type="primary")
+        start_btn = st.button(f"🚀 开始批量比对处理 ({len(org_files)}张)", use_container_width=True, type="primary")
 
     if start_btn:
         st.markdown("### 🏆 处理结果")
         
-        # 加载参考图 (只需要加载一次)
-        with st.spinner("正在加载参考图..."):
-            ref_img = load_uploaded_image(ref_file)
-            st.image(ref_file, caption="🎯 你的标准参考图", width=300)
-            
-        st.write("---")
-
-        # 循环处理每一张原图
-        for idx, org_file in enumerate(org_files):
-            with st.container():
-                st.write(f"**处理进度: {idx + 1} / {len(org_files)} - 文件名: {org_file.name}**")
+        # 用于打包 ZIP 文件的内存缓冲区
+        zip_buffer = BytesIO()
+        success_count = 0
+        
+        with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
+            for idx, org_file in enumerate(org_files):
+                st.write(f"**处理: {org_file.name}**")
+                
+                # 寻找对应的参考图
+                matched_ref_file = find_matching_reference(org_file.name, ref_files)
+                
+                if not matched_ref_file:
+                    st.warning(f"⚠️ 跳过：没有找到与 {org_file.name} 匹配的参考图。")
+                    st.write("---")
+                    continue
                 
                 try:
-                    # 加入容错机制，单张失败不会导致全盘崩溃
+                    # 读取图片
                     org_img = load_uploaded_image(org_file)
+                    
+                    # 每次读取匹配到的参考图（因为参考图可能有多个）
+                    matched_ref_file.seek(0) 
+                    ref_img = load_uploaded_image(matched_ref_file)
+                    
+                    # 处理对齐
                     result_img, msg = align_and_crop(org_img, ref_img)
 
                     if result_img is not None:
+                        # 转换颜色格式用于网页显示
+                        ref_rgb = cv2.cvtColor(ref_img, cv2.COLOR_BGR2RGB)
                         result_rgb = cv2.cvtColor(result_img, cv2.COLOR_BGR2RGB)
                         
-                        r_col1, r_col2 = st.columns([1, 2])
-                        with r_col1:
-                            st.image(org_file, caption="原图预览", use_container_width=True)
-                        with r_col2:
-                            st.image(result_rgb, caption="✨ 处理完成", use_container_width=True)
-                            
-                            # 下载按钮
-                            result_bytes = convert_cv_to_bytes(result_img)
-                            st.download_button(
-                                label=f"💾 下载这图",
-                                data=result_bytes,
-                                file_name=f"aligned_{org_file.name}",
-                                mime="image/jpeg",
-                                key=f"dl_{idx}" # key必须唯一
-                            )
-                        st.success("✅ 成功")
+                        # 显示变小：使用更多的列来挤压图片宽度
+                        d_col1, d_col2, d_col3, d_col4 = st.columns([1, 1, 2, 2])
+                        with d_col1:
+                            st.image(ref_rgb, caption=f"参考标准 ({matched_ref_file.name})", use_container_width=True)
+                        with d_col2:
+                            st.image(result_rgb, caption=f"裁切结果", use_container_width=True)
+                        with d_col3:
+                            st.success(f"✅ 对齐成功")
+                        
+                        # 将成功的结果写入 ZIP 包中
+                        result_bytes = convert_cv_to_bytes(result_img, ext=os.path.splitext(org_file.name)[1])
+                        zip_file.writestr(f"aligned_{org_file.name}", result_bytes)
+                        success_count += 1
                     else:
-                        st.warning(f"❌ 失败：{msg}")
+                        st.error(f"❌ 失败：{msg}")
                         
                 except Exception as e:
-                    # 如果发生未知错误，捕获并在网页上显示，而不是让网页崩溃
-                    st.error(f"⚠️ 处理 {org_file.name} 时发生系统错误: {str(e)}")
+                    st.error(f"⚠️ 系统错误: {str(e)}")
                 
                 st.write("---")
+        
+        # 批量处理结束，如果有成功的图片，显示下载压缩包按钮
+        if success_count > 0:
+            st.success(f"🎉 全部处理完成！共成功 {success_count} 张。")
+            st.download_button(
+                label="📦 一键下载所有处理好的图片 (ZIP压缩包)",
+                data=zip_buffer.getvalue(),
+                file_name="aligned_images.zip",
+                mime="application/zip",
+                type="primary",
+                use_container_width=True
+            )
