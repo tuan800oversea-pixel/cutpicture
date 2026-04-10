@@ -21,12 +21,18 @@ def convert_cv_to_bytes(cv_img):
     pil_img.save(buf, format='JPEG', quality=100, dpi=(300, 300))
     return buf.getvalue()
 
-# ================= 文件名匹配逻辑 =================
+# ================= 文件名匹配逻辑 (已更新) =================
 def find_matching_reference(org_filename, ref_files):
     org_base = os.path.splitext(org_filename)[0]
-    for ref in ref_files:
+    
+    # 核心优化：按参考文件名的长度降序排序。
+    # 这样可以防止如果你同时上传了 "1.jpg" 和 "11.jpg" 作为参考图时，原图 "211.jpg" 被错误匹配给 "1.jpg" 的情况。
+    sorted_refs = sorted(ref_files, key=lambda x: len(os.path.splitext(x.name)[0]), reverse=True)
+    
+    for ref in sorted_refs:
         ref_base = os.path.splitext(ref.name)[0]
-        if org_base == ref_base or org_base.endswith("_" + ref_base):
+        # 判断逻辑：原图名等于参考图名，或者原图名以参考图名结尾（比如 "11" 以 "1" 结尾）
+        if org_base == ref_base or org_base.endswith(ref_base):
             return ref
     return None
 
@@ -99,7 +105,7 @@ def align_and_crop_strict(org_img_highres, ref_img_highres):
 st.set_page_config(page_title="身材比例锁定-专业截图工具", page_icon="📏", layout="wide")
 
 st.title("📏 身材比例锁定 - 专业截图工具")
-st.info("本次更新：加入了 **'纵横比硬锁定'** 算法。无论图片如何对齐，模特的身高、胖瘦比例将 100% 保持原样，彻底解决变形问题。")
+st.info("本次更新：加入了 **'尾号自动匹配'** 功能。原图 (如 11.jpg) 只要尾号匹配参考图 (如 1.jpg) 即可自动处理，且导出名为 1.jpg。")
 
 col1, col2 = st.columns(2)
 with col1:
