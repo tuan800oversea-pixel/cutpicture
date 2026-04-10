@@ -17,166 +17,145 @@ def convert_cv_to_bytes(cv_img):
     cv_img_rgb = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
     pil_img = Image.fromarray(cv_img_rgb)
     buf = BytesIO()
+    # 强制 300 DPI 输出，确保印刷质量
     pil_img.save(buf, format='JPEG', quality=100, dpi=(300, 300))
     return buf.getvalue()
 
-# ================= 文件名智能匹配逻辑 =================
+# ================= 文件名匹配逻辑 =================
 def find_matching_reference(org_filename, ref_files):
     org_base = os.path.splitext(org_filename)[0]
     for ref in ref_files:
         ref_base = os.path.splitext(ref.name)[0]
-        if org_base == ref_base:
-            return ref
-    for ref in ref_files:
-        ref_base = os.path.splitext(ref.name)[0]
-        if org_base.endswith(ref_base):
+        if org_base == ref_base or org_base.endswith("_" + ref_base):
             return ref
     return None
 
-# ================= 核心算法：双轨制高清对齐 =================
-def align_and_crop(org_img_highres, ref_img_highres):
+# ================= 核心算法：100% 比例锁定对齐 =================
+def align_and_crop_strict(org_img_highres, ref_img_highres):
     h_org, w_org = org_img_highres.shape[:2]
     h_ref, w_ref = ref_img_highres.shape[:2]
 
-    max_calc_size = 800
-    scale_org = 1.0
-    if max(h_org, w_org) > max_calc_size:
-        scale_org = max(h_org, w_org) / max_calc_size
-        org_img_small = cv2.resize(org_img_highres, (int(w_org / scale_org), int(h_org / scale_org)))
-    else:
-        org_img_small = org_img_highres.copy()
+    # 1. 预处理：转为中等尺寸进行特征计算，提高精度
+    max_calc_size = 1200
+    scale_down_org = max(h_org, w_org) / max_calc_size if max(h_org, w_org) > max_calc_size else 1.0
+    scale_down_ref = max(h_ref, w_ref) / max_calc_size if max(h_ref, w_ref) > max_calc_size else 1.0
 
-    scale_ref = 1.0
-    if max(h_ref, w_ref) > max_calc_size:
-        scale_ref = max(h_ref, w_ref) / max_calc_size
-        ref_img_small = cv2.resize(ref_img_highres, (int(w_ref / scale_ref), int(h_ref / scale_ref)))
-    else:
-        ref_img_small = ref_img_highres.copy()
+    org_img_small = cv2.resize(org_img_highres, (int(w_org / scale_down_org), int(h_org / scale_down_org)), interpolation=cv2.INTER_AREA)
+    ref_img_small = cv2.resize(ref_img_highres, (int(w_ref / scale_down_ref), int(h_ref / scale_down_ref)), interpolation=cv2.INTER_AREA)
 
-    gray_org = cv2.cvtColor(org_img_small, cv2.COLOR_BGR2GRAY)
-    gray_ref = cv2.cvtColor(ref_img_small, cv2.COLOR_BGR2GRAY)
+    # 2. SIFT 特征提取
+    sift = cv2.SIFT_create(nfeatures=2000)
+    kp_ref, des_ref = sift.detectAndCompute(cv2.cvtColor(ref_img_small, cv2.COLOR_BGR2GRAY), None)
+    kp_org, des_org = sift.detectAndCompute(cv2.cvtColor(org_img_small, cv2.COLOR_BGR2GRAY), None)
 
-    sift = cv2.SIFT_create()
-    kp1, des1 = sift.detectAndCompute(gray_ref, None)
-    kp2, des2 = sift.detectAndCompute(gray_org, None)
+    if des_org is None or des_ref is None or len(kp_org) < 10:
+        return None, "特征提取失败：图片过于模糊或内容无法匹配"
 
-    if des2 is None or len(kp2) < 10:
-        return None, "原图特征点太少，无法对齐"
-
+    # 3. 匹配特征点
     bf = cv2.BFMatcher()
-    matches = bf.knnMatch(des1, des2, k=2)
-
-    good_matches = []
-    for m, n in matches:
-        if m.distance < 0.75 * n.distance:
-            good_matches.append(m)
+    matches = bf.knnMatch(des_ref, des_org, k=2)
+    # 更加严格的匹配过滤 (0.65)
+    good_matches = [m for m, n in matches if m.distance < 0.65 * n.distance]
 
     if len(good_matches) < 10:
-        return None, "匹配点不足，图片差异过大"
+        return None, "匹配点不足：请确认模特姿势是否与参考图基本一致"
 
-    src_pts = np.float32([kp1[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
-    dst_pts = np.float32([kp2[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+    # 4. 坐标映射回原尺寸
+    src_pts = np.float32([kp_ref[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2) * scale_down_ref
+    dst_pts = np.float32([kp_org[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2) * scale_down_org
+
+    # 5. 计算相似变换矩阵（RANSAC 过滤噪声）
+    M, mask = cv2.estimateAffinePartial2D(dst_pts, src_pts, method=cv2.RANSAC, ransacReprojThreshold=3.0)
+
+    if M is None:
+        return None, "无法计算对齐路径"
+
+    # 6. 【核心优化】锁定纵横比 (Aspect Ratio Lock)
+    # M 矩阵的前两列包含了缩放和旋转信息：[[a, b, tx], [c, d, ty]]
+    # 计算当前变换的缩放因子
+    s_x = np.sqrt(M[0, 0]**2 + M[0, 1]**2)
+    s_y = np.sqrt(M[1, 0]**2 + M[1, 1]**2)
     
-    src_pts = src_pts * scale_ref  
-    dst_pts = dst_pts * scale_org  
-
-    M, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
-    if M is None: return None, "无法计算透视变换矩阵"
-
-    pts_ref = np.float32([[0, 0], [0, h_ref - 1], [w_ref - 1, h_ref - 1], [w_ref - 1, 0]]).reshape(-1, 1, 2)
+    # 强制令 s_x = s_y，取两者的平均值，彻底杜绝拉伸变瘦/变胖
+    avg_scale = (s_x + s_y) / 2.0
     
-    try:
-        dst_corners = cv2.perspectiveTransform(pts_ref, M)
-    except:
-        return None, "数学变换失败，图片变形过大"
+    # 重新归一化矩阵中的旋转部分，并统一应用平均缩放因子
+    rotation_angle = np.arctan2(M[1, 0], M[0, 0])
+    M[0, 0] = avg_scale * np.cos(rotation_angle)
+    M[0, 1] = -avg_scale * np.sin(rotation_angle)
+    M[1, 0] = avg_scale * np.sin(rotation_angle)
+    M[1, 1] = avg_scale * np.cos(rotation_angle)
 
-    dst_pts_affine = np.float32([dst_corners[0][0], dst_corners[1][0], dst_corners[2][0], dst_corners[3][0]])
-    ref_pts_affine = np.float32([[0, 0], [0, h_ref], [w_ref, h_ref], [w_ref, 0]])
-
-    affine_matrix = cv2.getPerspectiveTransform(dst_pts_affine, ref_pts_affine)
+    # 7. 应用变换
+    result_highres = cv2.warpAffine(org_img_highres, M, (w_ref, h_ref), 
+                                    flags=cv2.INTER_LANCZOS4, 
+                                    borderMode=cv2.BORDER_CONSTANT, 
+                                    borderValue=(255, 255, 255))
     
-    result_highres = cv2.warpPerspective(org_img_highres, affine_matrix, (w_ref, h_ref), 
-                                         borderMode=cv2.BORDER_CONSTANT, borderValue=(255, 255, 255))
     return result_highres, "成功"
 
 
-# ================= 网页界面 (Streamlit) =================
-st.set_page_config(page_title="标准需求自动截图", page_icon="📸", layout="wide")
+# ================= Streamlit UI =================
+st.set_page_config(page_title="身材比例锁定-专业截图工具", page_icon="📏", layout="wide")
 
-st.title("📸 标准需求自动截图")
-st.markdown("**支持智能匹配：** 原图和参考图依靠文件名自动匹配（原图 `21.jpg` 会自动使用 `1.jpg` 作参考）。导出结果为 **参考图的命名**，画质为 **100% 质量、300 DPI 的 JPG**。")
-st.divider()
+st.title("📏 身材比例锁定 - 专业截图工具")
+st.info("本次更新：加入了 **'纵横比硬锁定'** 算法。无论图片如何对齐，模特的身高、胖瘦比例将 100% 保持原样，彻底解决变形问题。")
 
 col1, col2 = st.columns(2)
-
 with col1:
-    org_files = st.file_uploader("1️⃣ 上传【修好的高清原图-带头版】(可多选)", type=['png', 'jpg', 'jpeg'], accept_multiple_files=True, key="org")
-
+    org_files = st.file_uploader("1️⃣ 上传高清原图 (待截图)", type=['png', 'jpg', 'jpeg'], accept_multiple_files=True)
 with col2:
-    ref_files = st.file_uploader("2️⃣ 上传【参考的拍图模板图-截头后】(可多选)", type=['png', 'jpg', 'jpeg'], accept_multiple_files=True, key="ref")
+    ref_files = st.file_uploader("2️⃣ 上传参考模板图 (定坐标)", type=['png', 'jpg', 'jpeg'], accept_multiple_files=True)
 
 if org_files and ref_files:
     st.divider()
-    col_btn1, col_btn2, col_btn3 = st.columns([1, 1, 1])
-    with col_btn2:
-        start_btn = st.button(f"🚀 开始无损比对处理 ({len(org_files)}张)", use_container_width=True, type="primary")
-
-    if start_btn:
+    if st.button("🚀 启动 100% 等比无损处理", type="primary", use_container_width=True):
         zip_buffer = BytesIO()
         success_count = 0
         
         with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
-            for idx, org_file in enumerate(org_files):
-                st.write(f"**正在处理: {org_file.name}**")
-                matched_ref_file = find_matching_reference(org_file.name, ref_files)
+            for org_file in org_files:
+                matched_ref = find_matching_reference(org_file.name, ref_files)
                 
-                if not matched_ref_file:
-                    st.warning(f"⚠️ 跳过：未找到对应的参考图。")
-                    st.write("---")
+                if not matched_ref:
+                    st.warning(f"跳过: {org_file.name} (未找到匹配模板)")
                     continue
                 
                 try:
-                    org_img = load_raw_image(org_file)
-                    matched_ref_file.seek(0) 
-                    ref_img = load_raw_image(matched_ref_file)
+                    # 读取图片
+                    img_org = load_raw_image(org_file)
+                    matched_ref.seek(0)
+                    img_ref = load_raw_image(matched_ref)
                     
-                    result_img, msg = align_and_crop(org_img, ref_img)
+                    # 执行严格对齐
+                    res_img, msg = align_and_crop_strict(img_org, img_ref)
 
-                    if result_img is not None:
-                        ref_display = cv2.resize(ref_img, (0,0), fx=0.3, fy=0.3)
-                        res_display = cv2.resize(result_img, (0,0), fx=0.3, fy=0.3)
+                    if res_img is not None:
+                        # 转换并打包
+                        ref_name = os.path.splitext(matched_ref.name)[0]
+                        file_name = f"{ref_name}.jpg"
                         
-                        ref_rgb = cv2.cvtColor(ref_display, cv2.COLOR_BGR2RGB)
-                        result_rgb = cv2.cvtColor(res_display, cv2.COLOR_BGR2RGB)
+                        img_bytes = convert_cv_to_bytes(res_img)
+                        zip_file.writestr(file_name, img_bytes)
                         
-                        d_col1, d_col2, d_col3, d_col4 = st.columns([1, 1, 2, 2])
-                        with d_col1: st.image(ref_rgb, caption=f"参考", use_container_width=True)
-                        with d_col2: st.image(result_rgb, caption=f"结果", use_container_width=True)
-                        with d_col3: st.success(f"✅ 处理成功 (300 DPI)")
+                        # 实时预览
+                        with st.expander(f"✅ 已处理: {org_file.name} ➔ {file_name}", expanded=False):
+                            preview_res = cv2.resize(res_img, (0,0), fx=0.15, fy=0.15)
+                            st.image(cv2.cvtColor(preview_res, cv2.COLOR_BGR2RGB))
                         
-                        # ================= 命名逻辑修改 =================
-                        # 提取【参考图】的文件名（去掉后缀）
-                        ref_base_name = os.path.splitext(matched_ref_file.name)[0]
-                        # 强制指定新文件名为：参考图文件名.jpg (例如：1.jpg)
-                        final_filename = f"{ref_base_name}.jpg"
-                        
-                        result_bytes = convert_cv_to_bytes(result_img)
-                        zip_file.writestr(final_filename, result_bytes)
                         success_count += 1
                     else:
-                        st.error(f"❌ 失败：{msg}")
+                        st.error(f"❌ {org_file.name} 失败: {msg}")
                         
                 except Exception as e:
-                    st.error(f"⚠️ 错误: {str(e)}")
-                
-                st.write("---")
-        
+                    st.error(f"⚠️ 处理 {org_file.name} 时出错: {str(e)}")
+
         if success_count > 0:
+            st.divider()
             st.download_button(
-                label=f"📦 下载 {success_count} 张处理好的图片 (ZIP)",
+                label=f"📥 下载处理完成的 {success_count} 张打包文件",
                 data=zip_buffer.getvalue(),
-                file_name="aligned_highres_images.zip",
+                file_name="strict_aligned_images.zip",
                 mime="application/zip",
-                type="primary",
                 use_container_width=True
             )
