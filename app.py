@@ -21,17 +21,16 @@ def convert_cv_to_bytes(cv_img):
     pil_img.save(buf, format='JPEG', quality=100, dpi=(300, 300))
     return buf.getvalue()
 
-# ================= 文件名匹配逻辑 (已更新) =================
+# ================= 文件名匹配逻辑 =================
 def find_matching_reference(org_filename, ref_files):
     org_base = os.path.splitext(org_filename)[0]
     
     # 核心优化：按参考文件名的长度降序排序。
-    # 这样可以防止如果你同时上传了 "1.jpg" 和 "11.jpg" 作为参考图时，原图 "211.jpg" 被错误匹配给 "1.jpg" 的情况。
     sorted_refs = sorted(ref_files, key=lambda x: len(os.path.splitext(x.name)[0]), reverse=True)
     
     for ref in sorted_refs:
         ref_base = os.path.splitext(ref.name)[0]
-        # 判断逻辑：原图名等于参考图名，或者原图名以参考图名结尾（比如 "11" 以 "1" 结尾）
+        # 判断逻辑：原图名等于参考图名，或者原图名以参考图名结尾
         if org_base == ref_base or org_base.endswith(ref_base):
             return ref
     return None
@@ -77,15 +76,11 @@ def align_and_crop_strict(org_img_highres, ref_img_highres):
         return None, "无法计算对齐路径"
 
     # 6. 【核心优化】锁定纵横比 (Aspect Ratio Lock)
-    # M 矩阵的前两列包含了缩放和旋转信息：[[a, b, tx], [c, d, ty]]
-    # 计算当前变换的缩放因子
     s_x = np.sqrt(M[0, 0]**2 + M[0, 1]**2)
     s_y = np.sqrt(M[1, 0]**2 + M[1, 1]**2)
     
-    # 强制令 s_x = s_y，取两者的平均值，彻底杜绝拉伸变瘦/变胖
     avg_scale = (s_x + s_y) / 2.0
     
-    # 重新归一化矩阵中的旋转部分，并统一应用平均缩放因子
     rotation_angle = np.arctan2(M[1, 0], M[0, 0])
     M[0, 0] = avg_scale * np.cos(rotation_angle)
     M[0, 1] = -avg_scale * np.sin(rotation_angle)
@@ -144,10 +139,20 @@ if org_files and ref_files:
                         img_bytes = convert_cv_to_bytes(res_img)
                         zip_file.writestr(file_name, img_bytes)
                         
-                        # 实时预览
-                        with st.expander(f"✅ 已处理: {org_file.name} ➔ {file_name}", expanded=False):
-                            preview_res = cv2.resize(res_img, (0,0), fx=0.15, fy=0.15)
-                            st.image(cv2.cvtColor(preview_res, cv2.COLOR_BGR2RGB))
+                        # ================= 修改开始：实时预览（左右对比） =================
+                        with st.expander(f"✅ 已处理: {org_file.name} ➔ {file_name}", expanded=True):
+                            preview_col1, preview_col2 = st.columns(2)
+                            
+                            with preview_col1:
+                                st.markdown("**🖼️ 参考模板图**")
+                                preview_ref = cv2.resize(img_ref, (0,0), fx=0.15, fy=0.15)
+                                st.image(cv2.cvtColor(preview_ref, cv2.COLOR_BGR2RGB), use_container_width=True)
+                                
+                            with preview_col2:
+                                st.markdown("**✨ 截图后的图片**")
+                                preview_res = cv2.resize(res_img, (0,0), fx=0.15, fy=0.15)
+                                st.image(cv2.cvtColor(preview_res, cv2.COLOR_BGR2RGB), use_container_width=True)
+                        # ================= 修改结束 =================
                         
                         success_count += 1
                     else:
