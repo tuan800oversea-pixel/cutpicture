@@ -97,16 +97,18 @@ def align_and_crop_strict(org_img_highres, ref_img_highres):
 
 
 # ================= Streamlit UI =================
-st.set_page_config(page_title="身材比例锁定-专业截图工具", page_icon="📏", layout="wide")
+st.set_page_config(page_title="按着拍图模板自动裁图", page_icon="📏", layout="wide")
 
-st.title("📏 身材比例锁定 - 专业截图工具")
-st.info("本次更新：加入了 **'尾号自动匹配'** 功能。原图 (如 11.jpg) 只要尾号匹配参考图 (如 1.jpg) 即可自动处理，且导出名为 1.jpg。")
+# 修改了标题并去掉了更新说明
+st.title("📏 按着拍图模板自动裁图")
 
 col1, col2 = st.columns(2)
 with col1:
-    org_files = st.file_uploader("1️⃣ 上传高清原图 (待截图)", type=['png', 'jpg', 'jpeg'], accept_multiple_files=True)
+    # 修改了文案
+    org_files = st.file_uploader("1️⃣ 上传修后原图(待截图)", type=['png', 'jpg', 'jpeg'], accept_multiple_files=True)
 with col2:
-    ref_files = st.file_uploader("2️⃣ 上传参考模板图 (定坐标)", type=['png', 'jpg', 'jpeg'], accept_multiple_files=True)
+    # 修改了文案
+    ref_files = st.file_uploader("2️⃣ 上传拍图模板图片(截图后)", type=['png', 'jpg', 'jpeg'], accept_multiple_files=True)
 
 if org_files and ref_files:
     st.divider()
@@ -141,19 +143,20 @@ if org_files and ref_files:
                         
                         # ================= 实时预览展示 =================
                         with st.expander(f"✅ 已处理: {org_file.name} ➔ {file_name}", expanded=True):
-                            preview_col1, preview_col2 = st.columns(2)
+                            # 使用 [1.5, 1.5, 7] 的比例，把前两列空间压缩，让它们紧挨在一起，后面留白
+                            preview_col1, preview_col2, _ = st.columns([1.5, 1.5, 7])
                             
                             with preview_col1:
                                 st.markdown("**🖼️ 参考模板图**")
                                 preview_ref = cv2.resize(img_ref, (0,0), fx=0.15, fy=0.15)
-                                # 核心修改点：加入 width=150 限制图片宽度
-                                st.image(cv2.cvtColor(preview_ref, cv2.COLOR_BGR2RGB), width=150)
+                                # 图片宽度改为了 100
+                                st.image(cv2.cvtColor(preview_ref, cv2.COLOR_BGR2RGB), width=100)
                                 
                             with preview_col2:
                                 st.markdown("**✨ 截图后的图片**")
                                 preview_res = cv2.resize(res_img, (0,0), fx=0.15, fy=0.15)
-                                # 核心修改点：加入 width=150 限制图片宽度
-                                st.image(cv2.cvtColor(preview_res, cv2.COLOR_BGR2RGB), width=150)
+                                # 图片宽度改为了 100
+                                st.image(cv2.cvtColor(preview_res, cv2.COLOR_BGR2RGB), width=100)
                         
                         success_count += 1
                     else:
