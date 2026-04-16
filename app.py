@@ -139,20 +139,21 @@ if org_files and ref_files:
                         img_bytes = convert_cv_to_bytes(res_img)
                         zip_file.writestr(file_name, img_bytes)
                         
-                        # ================= 修改开始：实时预览（左右对比） =================
+                        # ================= 实时预览展示 =================
                         with st.expander(f"✅ 已处理: {org_file.name} ➔ {file_name}", expanded=True):
                             preview_col1, preview_col2 = st.columns(2)
                             
                             with preview_col1:
                                 st.markdown("**🖼️ 参考模板图**")
                                 preview_ref = cv2.resize(img_ref, (0,0), fx=0.15, fy=0.15)
-                                st.image(cv2.cvtColor(preview_ref, cv2.COLOR_BGR2RGB), use_container_width=True)
+                                # 核心修改点：加入 width=150 限制图片宽度
+                                st.image(cv2.cvtColor(preview_ref, cv2.COLOR_BGR2RGB), width=150)
                                 
                             with preview_col2:
                                 st.markdown("**✨ 截图后的图片**")
                                 preview_res = cv2.resize(res_img, (0,0), fx=0.15, fy=0.15)
-                                st.image(cv2.cvtColor(preview_res, cv2.COLOR_BGR2RGB), use_container_width=True)
-                        # ================= 修改结束 =================
+                                # 核心修改点：加入 width=150 限制图片宽度
+                                st.image(cv2.cvtColor(preview_res, cv2.COLOR_BGR2RGB), width=150)
                         
                         success_count += 1
                     else:
