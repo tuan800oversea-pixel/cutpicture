@@ -6,6 +6,9 @@ import os
 import zipfile
 from PIL import Image
 
+# 引入 AI 抠图库
+from rembg import remove
+
 # ================= 图片加载 =================
 def load_raw_image(uploaded_file):
     file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
@@ -17,31 +20,57 @@ def convert_cv_to_bytes(cv_img):
     cv_img_rgb = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
     pil_img = Image.fromarray(cv_img_rgb)
     buf = BytesIO()
-    # 强制 300 DPI 输出，确保印刷质量
     pil_img.save(buf, format='JPEG', quality=100, dpi=(300, 300))
     return buf.getvalue()
 
 # ================= 文件名匹配逻辑 =================
 def find_matching_reference(org_filename, ref_files):
     org_base = os.path.splitext(org_filename)[0]
-    
-    # 核心优化：按参考文件名的长度降序排序。
     sorted_refs = sorted(ref_files, key=lambda x: len(os.path.splitext(x.name)[0]), reverse=True)
-    
     for ref in sorted_refs:
         ref_base = os.path.splitext(ref.name)[0]
-        # 判断逻辑：原图名等于参考图名，或者原图名以参考图名结尾
         if org_base == ref_base or org_base.endswith(ref_base):
             return ref
     return None
 
-# ================= 核心算法：重度抗螺纹高精度对齐 =================
+# ================= 核心算法：AI 抠图提取纯轮廓 (无视背景与内部摩尔纹) =================
+def get_ai_silhouette_masks(img_small_color):
+    """
+    使用 rembg 进行真正的 AI 语义分割，无论什么背景都能精准提取前景(人体/衣服)遮罩。
+    """
+    # 1. AI 生成精确的前景 Alpha 遮罩 (黑白图：前景白，背景黑)
+    # only_mask=True 表示我们只要黑白遮罩，不要抠出来的彩图
+    ai_mask = remove(img_small_color, only_mask=True)
+    
+    # 转换为 OpenCV 标准的单通道图以防万一
+    if len(ai_mask.shape) == 3:
+        ai_mask = cv2.cvtColor(ai_mask, cv2.COLOR_BGR2GRAY)
+        
+    gray_img = cv2.cvtColor(img_small_color, cv2.COLOR_BGR2GRAY)
+    
+    # 2. 提取外轮廓
+    contours, _ = cv2.findContours(ai_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    # --- 遮罩 A：边缘搜索带 (Edge Band) ---
+    # 沿着 AI 抠出来的边缘画一圈，强迫 SIFT 只能在这个边缘地带找特征，避开内部的摩尔纹水波
+    edge_mask = np.zeros_like(gray_img)
+    cv2.drawContours(edge_mask, contours, -1, 255, thickness=40)
+    
+    # --- 遮罩 B：平滑形状斑块 (Blob) ---
+    # 纯白色的剪影，用于 SIFT 失败时的极端形状对齐
+    blob_mask = np.zeros_like(gray_img)
+    cv2.drawContours(blob_mask, contours, -1, 255, thickness=cv2.FILLED)
+    blob_mask = cv2.GaussianBlur(blob_mask, (41, 41), 0) # 模糊边缘防锯齿干扰
+    blob_mask = np.float32(blob_mask) / 255.0
+    
+    return gray_img, edge_mask, blob_mask
+
+# ================= 核心对齐：外轮廓限制级对齐引擎 =================
 def align_and_crop_strict(org_img_highres, ref_img_highres):
     h_org, w_org = org_img_highres.shape[:2]
     h_ref, w_ref = ref_img_highres.shape[:2]
 
-    # 1. 预处理：降维打击
-    # 将计算尺寸从 1200 降到 800，强迫系统忽略细密的截图摩尔纹，只关注大轮廓
+    # 降维计算，提速并过滤高频噪点
     max_calc_size = 800
     scale_down_org = max(h_org, w_org) / max_calc_size if max(h_org, w_org) > max_calc_size else 1.0
     scale_down_ref = max(h_ref, w_ref) / max_calc_size if max(h_ref, w_ref) > max_calc_size else 1.0
@@ -49,41 +78,23 @@ def align_and_crop_strict(org_img_highres, ref_img_highres):
     org_img_small = cv2.resize(org_img_highres, (int(w_org / scale_down_org), int(h_org / scale_down_org)), interpolation=cv2.INTER_AREA)
     ref_img_small = cv2.resize(ref_img_highres, (int(w_ref / scale_down_ref), int(h_ref / scale_down_ref)), interpolation=cv2.INTER_AREA)
 
-    # 转为灰度图
-    gray_org_small = cv2.cvtColor(org_img_small, cv2.COLOR_BGR2GRAY)
-    gray_ref_small = cv2.cvtColor(ref_img_small, cv2.COLOR_BGR2GRAY)
-    
-    # ================= 核心突破：重度摩尔纹消除组合拳 =================
-    # 招式一：中值滤波 (Median Blur)。它是结构性噪声（水波纹、网格）的天然克星
-    blur_org = cv2.medianBlur(gray_org_small, 5)
-    blur_ref = cv2.medianBlur(gray_ref_small, 5)
-
-    # 招式二：双边滤波 (Bilateral Filter)。给面料做极强力的“磨皮”，但死死保住衣服边缘和系带的锐利度
-    blur_org = cv2.bilateralFilter(blur_org, d=9, sigmaColor=75, sigmaSpace=75)
-    blur_ref = cv2.bilateralFilter(blur_ref, d=9, sigmaColor=75, sigmaSpace=75)
-
-    # 招式三：CLAHE 增强。把磨皮后仅存的真实结构边缘（比如阴影轮廓）提亮
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)) # 稍微调低对比度，防止把噪点重新放大
-    gray_org_enhanced = clahe.apply(blur_org)
-    gray_ref_enhanced = clahe.apply(blur_ref)
-    # ====================================================================
-
-    # 2. SIFT 特征提取
-    sift = cv2.SIFT_create(nfeatures=10000)
-    kp_ref, des_ref = sift.detectAndCompute(gray_ref_enhanced, None)
-    kp_org, des_org = sift.detectAndCompute(gray_org_enhanced, None)
+    # 传入彩图给 AI 获取精准遮罩
+    gray_org, edge_mask_org, blob_org = get_ai_silhouette_masks(org_img_small)
+    gray_ref, edge_mask_ref, blob_ref = get_ai_silhouette_masks(ref_img_small)
 
     M_final = None
 
-    # 3. 尝试 SIFT 匹配
-    if des_org is not None and des_ref is not None and len(kp_org) >= 10:
+    # --- 策略 A：轮廓边缘特征匹配 (SIFT) ---
+    sift = cv2.SIFT_create(nfeatures=5000)
+    kp_ref, des_ref = sift.detectAndCompute(gray_ref, mask=edge_mask_ref)
+    kp_org, des_org = sift.detectAndCompute(gray_org, mask=edge_mask_org)
+
+    if des_org is not None and des_ref is not None and len(kp_org) > 5:
         bf = cv2.BFMatcher()
         matches = bf.knnMatch(des_ref, des_org, k=2)
-        
-        # 因为经过了重度滤波，特征点的独特性下降，这里放宽匹配通过率至 0.8
-        good_matches = [m for m, n in matches if m.distance < 0.8 * n.distance]
+        good_matches = [m for m, n in matches if m.distance < 0.75 * n.distance]
 
-        if len(good_matches) >= 10:
+        if len(good_matches) >= 6:
             src_pts = np.float32([kp_ref[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2) * scale_down_ref
             dst_pts = np.float32([kp_org[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2) * scale_down_org
 
@@ -91,12 +102,12 @@ def align_and_crop_strict(org_img_highres, ref_img_highres):
             if M is not None:
                 M_final = M
 
-    # 4. 【兜底方案】ECC 轮廓对齐
+    # --- 策略 B：纯形状盲眼对齐 (ECC 保底) ---
     if M_final is None:
         warp_matrix = np.eye(2, 3, dtype=np.float32)
-        criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 50, 0.001)
+        criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 100, 0.0005)
         try:
-            _, warp_matrix = cv2.findTransformECC(gray_ref_enhanced, gray_org_enhanced, warp_matrix, cv2.MOTION_AFFINE, criteria)
+            _, warp_matrix = cv2.findTransformECC(blob_ref, blob_org, warp_matrix, cv2.MOTION_AFFINE, criteria)
             M_final = warp_matrix.copy()
             scale_ratio = scale_down_ref / scale_down_org
             M_final[0, 0] *= scale_ratio
@@ -106,24 +117,23 @@ def align_and_crop_strict(org_img_highres, ref_img_highres):
             M_final[1, 1] *= scale_ratio
             M_final[1, 2] *= scale_down_ref
         except Exception:
-            return None, "匹配点极少且轮廓无法识别：请确认模特姿势是否与参考图基本一致"
+            return None, "轮廓匹配失败：两图的模特身形差异过大或特征被过度破坏"
 
     if M_final is None:
         return None, "无法计算对齐路径，请检查图片"
 
-    # 5. 锁定纵横比 (Aspect Ratio Lock)
+    # 锁定纵横比
     s_x = np.sqrt(M_final[0, 0]**2 + M_final[0, 1]**2)
     s_y = np.sqrt(M_final[1, 0]**2 + M_final[1, 1]**2)
-    
     avg_scale = (s_x + s_y) / 2.0
-    
     rotation_angle = np.arctan2(M_final[1, 0], M_final[0, 0])
+    
     M_final[0, 0] = avg_scale * np.cos(rotation_angle)
     M_final[0, 1] = -avg_scale * np.sin(rotation_angle)
     M_final[1, 0] = avg_scale * np.sin(rotation_angle)
     M_final[1, 1] = avg_scale * np.cos(rotation_angle)
 
-    # 6. 应用最终变换（在无损的高清原图上切图！）
+    # 裁切输出
     result_highres = cv2.warpAffine(org_img_highres, M_final, (w_ref, h_ref), 
                                     flags=cv2.INTER_LANCZOS4, 
                                     borderMode=cv2.BORDER_CONSTANT, 
@@ -162,7 +172,7 @@ if org_files and ref_files:
                     matched_ref.seek(0)
                     img_ref = load_raw_image(matched_ref)
                     
-                    with st.spinner(f"正在智能对齐 {org_file.name}..."):
+                    with st.spinner(f"正在智能抠图与对齐 {org_file.name} (初次运行需加载AI模型，稍等片刻)..."):
                         res_img, msg = align_and_crop_strict(img_org, img_ref)
 
                     if res_img is not None:
