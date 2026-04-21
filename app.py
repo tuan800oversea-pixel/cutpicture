@@ -6,16 +6,15 @@ import os
 import zipfile
 from PIL import Image
 
-# 引入 AI 抠图库
-from rembg import remove
+# 引入 MediaPipe，用于人体语义关键点检测
+import mediapipe as mp
 
-# ================= 图片加载 =================
+# ================= 图片加载与 300 DPI 处理 (保持原版) =================
 def load_raw_image(uploaded_file):
     file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
     img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
     return img
 
-# ================= 转换为 300 DPI 的 JPG =================
 def convert_cv_to_bytes(cv_img):
     cv_img_rgb = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
     pil_img = Image.fromarray(cv_img_rgb)
@@ -23,7 +22,7 @@ def convert_cv_to_bytes(cv_img):
     pil_img.save(buf, format='JPEG', quality=100, dpi=(300, 300))
     return buf.getvalue()
 
-# ================= 文件名匹配逻辑 =================
+# ================= 文件名匹配逻辑 (保持原版) =================
 def find_matching_reference(org_filename, ref_files):
     org_base = os.path.splitext(org_filename)[0]
     sorted_refs = sorted(ref_files, key=lambda x: len(os.path.splitext(x.name)[0]), reverse=True)
@@ -33,107 +32,115 @@ def find_matching_reference(org_filename, ref_files):
             return ref
     return None
 
-# ================= 核心算法：AI 抠图提取纯轮廓 (无视背景与内部摩尔纹) =================
-def get_ai_silhouette_masks(img_small_color):
-    """
-    使用 rembg 进行真正的 AI 语义分割，无论什么背景都能精准提取前景(人体/衣服)遮罩。
-    """
-    # 1. AI 生成精确的前景 Alpha 遮罩 (黑白图：前景白，背景黑)
-    # only_mask=True 表示我们只要黑白遮罩，不要抠出来的彩图
-    ai_mask = remove(img_small_color, only_mask=True)
-    
-    # 转换为 OpenCV 标准的单通道图以防万一
-    if len(ai_mask.shape) == 3:
-        ai_mask = cv2.cvtColor(ai_mask, cv2.COLOR_BGR2GRAY)
-        
-    gray_img = cv2.cvtColor(img_small_color, cv2.COLOR_BGR2GRAY)
-    
-    # 2. 提取外轮廓
-    contours, _ = cv2.findContours(ai_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
-    # --- 遮罩 A：边缘搜索带 (Edge Band) ---
-    # 沿着 AI 抠出来的边缘画一圈，强迫 SIFT 只能在这个边缘地带找特征，避开内部的摩尔纹水波
-    edge_mask = np.zeros_like(gray_img)
-    cv2.drawContours(edge_mask, contours, -1, 255, thickness=40)
-    
-    # --- 遮罩 B：平滑形状斑块 (Blob) ---
-    # 纯白色的剪影，用于 SIFT 失败时的极端形状对齐
-    blob_mask = np.zeros_like(gray_img)
-    cv2.drawContours(blob_mask, contours, -1, 255, thickness=cv2.FILLED)
-    blob_mask = cv2.GaussianBlur(blob_mask, (41, 41), 0) # 模糊边缘防锯齿干扰
-    blob_mask = np.float32(blob_mask) / 255.0
-    
-    return gray_img, edge_mask, blob_mask
+# ================= 核心算法：人体语义关键点对齐 (究极进化) =================
 
-# ================= 核心对齐：外轮廓限制级对齐引擎 =================
+def get_body_keypoints(img, height_scale=0.5):
+    """
+    使用 MediaPipePose 检测人体语义关键点。
+    为了加快检测速度，将图片缩小进行检测。
+    """
+    mp_pose = mp.solutions.pose
+    h, w = img.shape[:2]
+    
+    # 缩小计算，提速
+    max_calc_size = 600
+    scale = max(h, w) / max_calc_size if max(h, w) > max_calc_size else 1.0
+    img_small = cv2.resize(img, (int(w / scale), int(h / scale)), interpolation=cv2.INTER_AREA)
+    h_small, w_small = img_small.shape[:2]
+
+    with mp_pose.Pose(
+        static_image_mode=True,
+        model_complexity=1,  # 使用中等模型，平衡速度和精度
+        enable_segmentation=False,
+        min_detection_confidence=0.5) as pose:
+        
+        results = pose.process(cv2.cvtColor(img_small, cv2.COLOR_BGR2RGB))
+        
+        if not results.pose_landmarks:
+            return None, "人体结构检测失败，请确认图片中有清晰可辨的人物"
+
+        # 提取相关关键点：
+        # 这里提取了腰（hips）和大腿中点（thighs），以对齐泳裤区域
+        landmarks = results.pose_landmarks.landmark
+        
+        # 将相对坐标映射回缩小后的图坐标系
+        def to_small_coords(landmark):
+            return [int(landmark.x * w_small), int(landmark.y * h_small)]
+        
+        relevant_indices = [23, 24, 25, 26, 27, 28] # Hips, Knees, Ankles
+        points_small = []
+        
+        # Hips (腰/臀点)
+        left_hip = to_small_coords(landmarks[23])
+        right_hip = to_small_coords(landmarks[24])
+        # Knees (大腿中点/膝盖点)
+        left_knee = to_small_coords(landmarks[25])
+        right_knee = to_small_coords(landmarks[26])
+
+        # 组合成稳定且相关的点对
+        # 1. 腰中点
+        hip_center = [(left_hip[0] + right_hip[0]) // 2, (left_hip[1] + right_hip[1]) // 2]
+        # 2. 大腿中点 (对齐泳裤区域最关键的点对)
+        thigh_center = [(left_knee[0] + right_knee[0]) // 2, (left_knee[1] + right_knee[1]) // 2]
+        # 3. 大腿长度向量的方向
+        thigh_direction = [thigh_center[0] - hip_center[0], thigh_center[1] - hip_center[1]]
+        
+        points_small = [
+            hip_center,       # 点1: 腰中点
+            thigh_center,     # 点2: 大腿中点
+        ]
+
+        # 计算一个稳定的旋转向量方向
+        points_small = np.float32(points_small)
+        
+        # 将关键点坐标放大回原始高清大图坐标系
+        points_highres = points_small * scale
+        
+        return points_highres, "成功"
+
 def align_and_crop_strict(org_img_highres, ref_img_highres):
     h_org, w_org = org_img_highres.shape[:2]
     h_ref, w_ref = ref_img_highres.shape[:2]
 
-    # 降维计算，提速并过滤高频噪点
-    max_calc_size = 800
-    scale_down_org = max(h_org, w_org) / max_calc_size if max(h_org, w_org) > max_calc_size else 1.0
-    scale_down_ref = max(h_ref, w_ref) / max_calc_size if max(h_ref, w_ref) > max_calc_size else 1.0
+    # 1. 分别提取人体关键点
+    mp_points_org, msg_org = get_body_keypoints(org_img_highres)
+    mp_points_ref, msg_ref = get_body_keypoints(ref_img_highres)
 
-    org_img_small = cv2.resize(org_img_highres, (int(w_org / scale_down_org), int(h_org / scale_down_org)), interpolation=cv2.INTER_AREA)
-    ref_img_small = cv2.resize(ref_img_highres, (int(w_ref / scale_down_ref), int(h_ref / scale_down_ref)), interpolation=cv2.INTER_AREA)
-
-    # 传入彩图给 AI 获取精准遮罩
-    gray_org, edge_mask_org, blob_org = get_ai_silhouette_masks(org_img_small)
-    gray_ref, edge_mask_ref, blob_ref = get_ai_silhouette_masks(ref_img_small)
+    if mp_points_org is None:
+        return None, f"原图人体结构检测失败：{msg_org}"
+    if mp_points_ref is None:
+        return None, f"模板图人体结构检测失败：{msg_ref}"
 
     M_final = None
 
-    # --- 策略 A：轮廓边缘特征匹配 (SIFT) ---
-    sift = cv2.SIFT_create(nfeatures=5000)
-    kp_ref, des_ref = sift.detectAndCompute(gray_ref, mask=edge_mask_ref)
-    kp_org, des_org = sift.detectAndCompute(gray_org, mask=edge_mask_org)
-
-    if des_org is not None and des_ref is not None and len(kp_org) > 5:
-        bf = cv2.BFMatcher()
-        matches = bf.knnMatch(des_ref, des_org, k=2)
-        good_matches = [m for m, n in matches if m.distance < 0.75 * n.distance]
-
-        if len(good_matches) >= 6:
-            src_pts = np.float32([kp_ref[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2) * scale_down_ref
-            dst_pts = np.float32([kp_org[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2) * scale_down_org
-
-            M, mask = cv2.estimateAffinePartial2D(dst_pts, src_pts, method=cv2.RANSAC, ransacReprojThreshold=5.0)
-            if M is not None:
-                M_final = M
-
-    # --- 策略 B：纯形状盲眼对齐 (ECC 保底) ---
-    if M_final is None:
-        warp_matrix = np.eye(2, 3, dtype=np.float32)
-        criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 100, 0.0005)
-        try:
-            _, warp_matrix = cv2.findTransformECC(blob_ref, blob_org, warp_matrix, cv2.MOTION_AFFINE, criteria)
-            M_final = warp_matrix.copy()
-            scale_ratio = scale_down_ref / scale_down_org
-            M_final[0, 0] *= scale_ratio
-            M_final[0, 1] *= scale_ratio
-            M_final[0, 2] *= scale_down_ref
-            M_final[1, 0] *= scale_ratio
-            M_final[1, 1] *= scale_ratio
-            M_final[1, 2] *= scale_down_ref
-        except Exception:
-            return None, "轮廓匹配失败：两图的模特身形差异过大或特征被过度破坏"
-
-    if M_final is None:
-        return None, "无法计算对齐路径，请检查图片"
-
-    # 锁定纵横比
-    s_x = np.sqrt(M_final[0, 0]**2 + M_final[0, 1]**2)
-    s_y = np.sqrt(M_final[1, 0]**2 + M_final[1, 1]**2)
-    avg_scale = (s_x + s_y) / 2.0
-    rotation_angle = np.arctan2(M_final[1, 0], M_final[0, 0])
+    # 2. 宏观对齐计算：依靠稳定的点对 (腰中点和大腿中点)
+    # 计算一个稳定的相似变换矩阵 (包含旋转、缩放、平移)
+    dst_pts = mp_points_org # 源点 (待截图原图)
+    src_pts = mp_points_ref # 目标点 (截图模板图)
     
-    M_final[0, 0] = avg_scale * np.cos(rotation_angle)
-    M_final[0, 1] = -avg_scale * np.sin(rotation_angle)
-    M_final[1, 0] = avg_scale * np.sin(rotation_angle)
-    M_final[1, 1] = avg_scale * np.cos(rotation_angle)
+    # 3. 计算最佳相似变换矩阵 (包含旋转、缩放和平移)
+    # estimateAffinePartial2D 在点对非常稳定时极其有效
+    M, _ = cv2.estimateAffinePartial2D(dst_pts, src_pts)
+    
+    if M is None:
+        # 如果 estimateAffinePartial2D 失败，可能是点对不够多
+        # 使用更简单的点对点计算保底
+        return None, "无法根据关键点计算变换，两图的模特身形差异可能过大"
+        
+    # 4. 【核心保留】锁定纵横比 (Aspect Ratio Lock)
+    # 确保 avg_scale 极其准确，防止体形被非等比例拉伸
+    s_x = np.sqrt(M[0, 0]**2 + M[0, 1]**2)
+    s_y = np.sqrt(M[1, 0]**2 + M[1, 1]**2)
+    avg_scale = (s_x + s_y) / 2.0
+    rotation_angle = np.arctan2(M[1, 0], M[0, 0])
+    
+    # 构建等比例相似变换矩阵
+    M_final = np.array([
+        [avg_scale * np.cos(rotation_angle), -avg_scale * np.sin(rotation_angle), M[0, 2]],
+        [avg_scale * np.sin(rotation_angle), avg_scale * np.cos(rotation_angle), M[1, 2]]
+    ], dtype=np.float32)
 
-    # 裁切输出
+    # 5. 应用最终变换（在高清原图上执行！）
     result_highres = cv2.warpAffine(org_img_highres, M_final, (w_ref, h_ref), 
                                     flags=cv2.INTER_LANCZOS4, 
                                     borderMode=cv2.BORDER_CONSTANT, 
@@ -172,17 +179,21 @@ if org_files and ref_files:
                     matched_ref.seek(0)
                     img_ref = load_raw_image(matched_ref)
                     
-                    with st.spinner(f"正在智能抠图与对齐 {org_file.name} (初次运行需加载AI模型，稍等片刻)..."):
+                    with st.spinner(f"正在智能对齐 {org_file.name} (初次运行加载人体模型，稍等片刻)..."):
+                        # 执行新的关键点对齐
                         res_img, msg = align_and_crop_strict(img_org, img_ref)
 
                     if res_img is not None:
+                        # 转换并打包
                         ref_name = os.path.splitext(matched_ref.name)[0]
                         file_name = f"{ref_name}.jpg"
                         
                         img_bytes = convert_cv_to_bytes(res_img)
                         zip_file.writestr(file_name, img_bytes)
                         
+                        # ================= 实时预览展示 =================
                         with st.expander(f"✅ 已处理: {org_file.name} ➔ {file_name}", expanded=True):
+                            # 使用原有的排版比例
                             preview_col1, preview_col2, _ = st.columns([1.5, 1.5, 7])
                             
                             with preview_col1:
