@@ -1,6 +1,4 @@
+streamlit
 opencv-python-headless
-opencv-contrib-python-headless
-mediapipe==0.10.9
-rembg
 numpy
 Pillow
