@@ -1,7 +1,5 @@
 mediapipe
-opencv-python-headless
+rembg
 numpy
 Pillow
-streamlit
-rembg
-onnxruntime
+opencv-python-headless
