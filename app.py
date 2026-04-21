@@ -35,7 +35,7 @@ def find_matching_reference(org_filename, ref_files):
             return ref
     return None
 
-# ================= 核心算法：抗纯色高精度对齐 (融合版) =================
+# ================= 核心算法：抗纯色、抗螺纹高精度对齐 =================
 def align_and_crop_strict(org_img_highres, ref_img_highres):
     h_org, w_org = org_img_highres.shape[:2]
     h_ref, w_ref = ref_img_highres.shape[:2]
@@ -48,13 +48,21 @@ def align_and_crop_strict(org_img_highres, ref_img_highres):
     org_img_small = cv2.resize(org_img_highres, (int(w_org / scale_down_org), int(h_org / scale_down_org)), interpolation=cv2.INTER_AREA)
     ref_img_small = cv2.resize(ref_img_highres, (int(w_ref / scale_down_ref), int(h_ref / scale_down_ref)), interpolation=cv2.INTER_AREA)
 
-    # 【核心新增】转为灰度图并应用 CLAHE 增强微弱纹理（针对纯色深色衣服优化）
+    # 转为灰度图
     gray_org_small = cv2.cvtColor(org_img_small, cv2.COLOR_BGR2GRAY)
     gray_ref_small = cv2.cvtColor(ref_img_small, cv2.COLOR_BGR2GRAY)
     
+    # 【核心新增：抗摩尔纹/螺纹优化】
+    # 对截图（参考图）和原图进行轻微的高斯模糊。
+    # 这一步必须在 CLAHE 增强之前，目的是为了抹平截图产生的虚假高频网格纹理，避免被当作特征点。
+    gray_org_blur = cv2.GaussianBlur(gray_org_small, (5, 5), 0)
+    gray_ref_blur = cv2.GaussianBlur(gray_ref_small, (5, 5), 0)
+
+    # 【核心新增：对比度增强】
+    # 应用 CLAHE 增强微弱纹理（针对纯色深色衣服优化）
     clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-    gray_org_enhanced = clahe.apply(gray_org_small)
-    gray_ref_enhanced = clahe.apply(gray_ref_small)
+    gray_org_enhanced = clahe.apply(gray_org_blur)
+    gray_ref_enhanced = clahe.apply(gray_ref_blur)
 
     # 2. SIFT 特征提取 (数量扩容至10000，解决找不到点的问题)
     sift = cv2.SIFT_create(nfeatures=10000)
@@ -67,7 +75,7 @@ def align_and_crop_strict(org_img_highres, ref_img_highres):
     if des_org is not None and des_ref is not None and len(kp_org) >= 10:
         bf = cv2.BFMatcher()
         matches = bf.knnMatch(des_ref, des_org, k=2)
-        # 放宽匹配条件至 0.75，适应纯色衣服的微弱特征
+        # 放宽匹配条件至 0.75，适应模糊处理后的微弱特征
         good_matches = [m for m, n in matches if m.distance < 0.75 * n.distance]
 
         if len(good_matches) >= 10:
@@ -80,7 +88,7 @@ def align_and_crop_strict(org_img_highres, ref_img_highres):
             if M is not None:
                 M_final = M
 
-    # 4. 【兜底方案新增】如果 SIFT 依然失败，触发 ECC 轮廓对齐
+    # 4. 【兜底方案】如果 SIFT 依然失败，触发 ECC 轮廓对齐
     if M_final is None:
         warp_matrix = np.eye(2, 3, dtype=np.float32)
         criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 50, 0.001)
